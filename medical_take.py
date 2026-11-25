@@ -9,6 +9,7 @@ from datetime import datetime
 from collections import defaultdict, Counter
 from sqlalchemy import create_engine
 import matplotlib.pyplot as plt
+from specialty_bed_optimisation import optimise_beds 
 
 ###################################################################################################
 ###################################################################################################
@@ -23,25 +24,22 @@ class default_params():
     run_name = 'Limited Beds'
     run_time = 24*60*(365 + 20) #One year plus 20 day warm up time
     run_days = int(run_time/(60*24)) 
-    iterations = 3#0
+    iterations = 10#0
     sample_time = 1
     print_outs = False
     occ_sample_time = 60
     pat_res = []
     occ_res = []
+    spec_res = []
 
-    #########Location Capacities
+    #########Settings
+    #True if infinite capacities, false if restrictions
     inf_model = False
-
-    if inf_model:
-        ED_beds = MRU_beds = SAU_beds = SDEC_beds = FSDEC_beds = SW_beds = np.inf
-    else:
-        ED_beds = 105
-        MRU_beds = 47
-        SAU_beds = 19
-        SDEC_beds = 45
-        FSDEC_beds = 10
-        SW_beds = 850
+    #(only relevant if above is false), if true, input total number of specialty beds and distribute
+    opt_spec = True
+    no_beds = 850
+    #True if user defined pathway probabilities
+    set_pathways = False
 
     #########Read in the data
     conn_str = open('G:/PerfInfo/Performance Management/OR Team/Useful Files/uhpbi conn string.txt', 'r')
@@ -53,12 +51,33 @@ class default_params():
     SQL.close()
     uhpbi_engine.dispose()
 
+    #########Specialties
+    specialties = df['PerformanceSpecialty'].drop_duplicates().tolist()
+    #Specialty probabilities
+    spec = df['PerformanceSpecialty'].value_counts()
+    spec = spec / spec.sum()
+
     #########timings
     ED_LoS = 4*60
     MRU_LoS = 12*60
-    SAU_LoS = 12*60
+    SAU_LoS = 8*60
     SDEC_FSDEC_LoS = 6*60
     Spec_LoS = df.groupby('PerformanceSpecialty')['Ward_LoS'].mean()
+
+    #########Location Capacities
+    if inf_model:
+        ED_beds = MRU_beds = SAU_beds = SDEC_beds = FSDEC_beds = np.inf
+        spec_beds = pd.DataFrame({'Specialty':specialties, 'No_beds':[np.inf]*len(specialties)})
+    else:
+        ED_beds = 105
+        MRU_beds = 47
+        SAU_beds = 19
+        SDEC_beds = 45
+        FSDEC_beds = 10
+        if opt_spec:
+            spec_beds = optimise_beds(df[['PerformanceSpecialty', 'Ward_arr', 'Ward_LoS']].copy().dropna().copy(), no_beds)
+        else:
+            spec_beds = pd.read_excel('G:/PerfInfo/Performance Management/OR Team/Emily Projects/Discrete Event Simulation/Medical Take/Inputs/Specialty Capacities.xlsx')
 
     #########Pathways
     #Get the probabilities of each pathway in the data
@@ -70,22 +89,24 @@ class default_params():
         path.append("Home")
         return path
 
-    paths = df.apply(build_path, axis=1)
-    transitions = pd.Series([(p[i], p[i+1]) for p in paths for i in range(len(p)-1)]
-                            ).value_counts().reset_index()
-    transitions.columns = ["pair", "count"]
-    transitions[["from", "to"]] = pd.DataFrame(transitions["pair"].tolist())
-    transitions["prob"] = transitions["count"] / transitions.groupby("from")["count"].transform("sum")
+    if not set_pathways:
+        paths = df.apply(build_path, axis=1)
+        transitions = pd.Series([(p[i], p[i+1]) for p in paths for i in range(len(p)-1)]
+                                ).value_counts().reset_index()
+        transitions.columns = ["pair", "count"]
+        transitions[["from", "to"]] = pd.DataFrame(transitions["pair"].tolist())
+        transitions["prob"] = transitions["count"] / transitions.groupby("from")["count"].transform("sum")
+    else:
+        transitions = pd.read_excel('G:/PerfInfo/Performance Management/OR Team/Emily Projects/Discrete Event Simulation/Medical Take/Inputs/Pathway Probabilities.xlsx')
+        check = transitions.groupby('from')['prob'].sum().round()
+        if len(check.loc[check != 1.0]) > 0:
+            print('ERROR!!!! PATHWAY PROBABILITIES DO NOT SUM TO 1')
 
     # Route lookup disctionary
     routing = defaultdict(lambda: ([], []))
     for _, r in transitions.iterrows():
         routing[r["from"]][0].append(r["to"])
         routing[r["from"]][1].append(r["prob"])
-
-    #Specialty probabilities
-    spec = df['PerformanceSpecialty'].value_counts()
-    spec = spec / spec.sum()
 
     #######Arrivals
     df['arrival'] = (df['ED_arr'].fillna(df['SDEC_arr']).fillna(df['MRU_SAU_arr'])
@@ -135,6 +156,7 @@ class Medical_Take_Model:
         #Set up lists to record results
         self.patient_results = []
         self.occupancy_results = []
+        self.spec_occupancy_results = []
         #start environment, set patient counter to 0 and set run number
         self.env = simpy.Environment()
         self.input_params = input_params
@@ -147,7 +169,8 @@ class Medical_Take_Model:
         self.SAU = simpy.PriorityResource(self.env, capacity=input_params.SAU_beds)
         self.SDEC = simpy.PriorityResource(self.env, capacity=input_params.SDEC_beds)
         self.FSDEC = simpy.PriorityResource(self.env, capacity=input_params.FSDEC_beds)
-        self.SW = simpy.PriorityResource(self.env, capacity=input_params.SW_beds)
+        self.spec_resources = {area : simpy.PriorityResource(self.env, capacity=cap)
+                               for area, cap in zip(input_params.spec_beds['Specialty'], input_params.spec_beds['No_beds'])}
 
     def arrivals(self):
         while True:
@@ -223,7 +246,8 @@ class Medical_Take_Model:
             #Specialty Ward
             if loc == 'Specialty Ward':
                 pat.Spec_queue = self.env.now
-                with self.SW.request() as req:
+                bed = self.spec_resources[pat.Specialty]
+                with bed.request() as req:
                     yield req
                     pat.Spec_arr = self.env.now
                     Av_LoS = self.input_params.Spec_LoS.loc[pat.Specialty]
@@ -237,43 +261,54 @@ class Medical_Take_Model:
 
 
     def store_patient_results(self, patient):
-        self.patient_results.append([self.run_number,
-                                     patient.id,
-                                     patient.path,
-                                     patient.model_arr,
-                                     patient.ED_queue,
-                                     patient.ED_arr,
-                                     patient.ED_dis,
-                                     patient.MRU_or_SAU,
-                                     patient.MoS_queue,
-                                     patient.MoS_arr,
-                                     patient.MoS_dis,
-                                     patient.FSDEC_or_SDEC,
-                                     patient.SDEC_queue,
-                                     patient.SDEC_arr,
-                                     patient.SDEC_dis,
-                                     patient.Specialty,
-                                     patient.Spec_queue,
-                                     patient.Spec_arr,
-                                     patient.Spec_dis,
-                                     patient.model_dis])
+        self.patient_results.append({'Run':self.run_number,
+                                     'Pat':patient.id,
+                                     'Path':patient.path,
+                                     'Model Arr':patient.model_arr,
+                                     'ED Queue':patient.ED_queue,
+                                     'ED Arr':patient.ED_arr,
+                                     'ED Dis':patient.ED_dis,
+                                     'MRU or SAU':patient.MRU_or_SAU,
+                                     'MRU or SAU Queue':patient.MoS_queue,
+                                     'MRU or SAU Arr':patient.MoS_arr,
+                                     'MRU or SAU Dis':patient.MoS_dis,
+                                     '(F)SDEC':patient.FSDEC_or_SDEC,
+                                     'SDEC Queue':patient.SDEC_queue,
+                                     'SDEC Arr':patient.SDEC_arr,
+                                     'SDEC Dis':patient.SDEC_dis,
+                                     'Specialty':patient.Specialty,
+                                     'Spec Queue':patient.Spec_queue,
+                                     'Spec Arr':patient.Spec_arr,
+                                     'Spec Dis':patient.Spec_dis,
+                                     'Home':patient.model_dis})
 
     def store_occupancy(self):
         while True:
-            self.occupancy_results.append([self.run_number,
-                                               self.ED._env.now,
-                                               len(self.ED.queue),
-                                               self.ED.count,
-                                               len(self.MRU.queue),
-                                               self.MRU.count,
-                                               len(self.SAU.queue),
-                                               self.SAU.count,
-                                               len(self.SDEC.queue),
-                                               self.SDEC.count,
-                                               len(self.FSDEC.queue),
-                                               self.FSDEC.count,
-                                               len(self.SW.queue),
-                                               self.SW.count])
+            #Get overall specialty queue and occ
+            spec_queue = sum(len(res.queue) for res in self.spec_resources.values())
+            spec_occ = sum(res.count for res in self.spec_resources.values())
+
+            self.occupancy_results.append({'Run':self.run_number,
+                                            'Time':self.ED._env.now,
+                                            'ED Queue':len(self.ED.queue),
+                                            'ED Occ':self.ED.count,
+                                            'MRU Queue':len(self.MRU.queue),
+                                            'MRU Occ':self.MRU.count,
+                                            'SAU Queue':len(self.SAU.queue),
+                                            'SAU Occ':self.SAU.count,
+                                            'SDEC Queue':len(self.SDEC.queue),
+                                            'SDEC Occ':self.SDEC.count,
+                                            'FSDEC Queue':len(self.FSDEC.queue),
+                                            'FSDEC Occ':self.FSDEC.count,
+                                            'Spec Queue':spec_queue,
+                                            'Spec Occ':spec_occ})
+            
+            for spec, res in self.spec_resources.items():
+                self.spec_occupancy_results.append({'run':self.run_number,
+                                                    'Time':self.env.now,
+                                                    'specialty':spec,
+                                                    'queue':len(res.queue),
+                                                    'occ':res.count,})
 
             yield self.env.timeout(self.input_params.occ_sample_time)
 
@@ -283,20 +318,19 @@ class Medical_Take_Model:
         self.env.run(until = self.input_params.run_time)
         default_params.pat_res += self.patient_results
         default_params.occ_res += self.occupancy_results
-        return self.patient_results, self.occupancy_results
+        default_params.spec_res += self.spec_occupancy_results
+        return self.patient_results, self.occupancy_results, self.spec_occupancy_results
 
-def export_results(pat_results, occ_results):
-    pat_df = pd.DataFrame(pat_results,
-                          columns = ['Run', 'Pat', 'Path', 'Model Arr', 'ED Queue', 'ED Arr', 'ED Dis', 'MRU or SAU',
-                                     'MRU or SAU Queue', 'MRU or SAU Arr', 'MRU or SAU Dis', '(F)SDEC', 'SDEC Queue',
-                                     'SDEC Arr', 'SDEC Dis', 'Specialty', 'Spec Queue', 'Spec Arr', 'Spec Dis', 'Home'])
-
-    occ_df = pd.DataFrame(occ_results,
-                          columns = ['Run', 'Time', 'ED Queue', 'ED Occ', 'MRU Queue', 'MRU Occ',
-                                     'SAU Queue', 'SAU Occ', 'SDEC Queue', 'SDEC Occ', 'FSDEC Queue',
-                                     'FSDEC Occ', 'Spec Queue', 'Spec Occ'])
+def export_results(pat_results, occ_results, spec_results):
+    #Patient
+    pat_df = pd.DataFrame(pat_results)
+    #Occuancy
+    occ_df = pd.DataFrame(occ_results)
     occ_df['Day'] = (occ_df['Time'] // (24*60)) - 20
-    return pat_df, occ_df
+    #Specialty occupancy
+    spec_occ_df = pd.DataFrame(spec_results)
+    spec_occ_df['Day'] = (spec_occ_df['Time'] // (24*60)) - 20
+    return pat_df, occ_df, spec_occ_df
 
 def run_the_model(input_params):
     #run the model for the number of iterations specified
@@ -304,11 +338,12 @@ def run_the_model(input_params):
         print(f"Run {run+1} of {input_params.iterations}")
         model = Medical_Take_Model(run, input_params)
         model.run()
-    patient_df, occ_df = export_results(input_params.pat_res,
-                                        input_params.occ_res)
-    return patient_df, occ_df
+    patient_df, occ_df, spec_occ_df = export_results(input_params.pat_res,
+                                                     input_params.occ_res,
+                                                     input_params.spec_res)
+    return patient_df, occ_df, spec_occ_df
 
-pat, occ = run_the_model(default_params)
+pat, occ, spec = run_the_model(default_params)
 #Create results folder if not exist
 path = f'G:/PerfInfo/Performance Management/OR Team/Emily Projects/Discrete Event Simulation/Medical Take/Results/{default_params.run_name}'
 os.makedirs(path, exist_ok=True)  # create if it doesn't exist (including parent dirs)
@@ -320,6 +355,7 @@ for file in ['Full Outputs', 'Plots']:
 #Save full data
 pat.to_csv(f'Full Outputs/patients - {default_params.run_name}.csv')
 occ.to_csv(f'Full Outputs/occupancy - {default_params.run_name}.csv')
+spec.to_csv(f'Full Outputs/specialty - {default_params.run_name}.csv')
 
 
 ###################################################################################################
@@ -337,6 +373,7 @@ def q75(x):
 
 #Remove warm up period
 occ = occ.loc[occ['Day'] > 0].copy()
+spec = spec.loc[spec['Day'] > 0].copy()
 
 ###################################################################################################
 ####4hr Performance
@@ -370,7 +407,7 @@ occ_metrics = (occ.groupby('Day', observed=False)
                      'FSDEC Occ':['min', q25, 'mean', q75, 'max'],
                      'Spec Occ':['min', q25, 'mean', q75, 'max']}))
 
-fig, axs = plt.subplots(3, 2, figsize=(30, 20), sharex='col', layout='constrained')
+fig, axs = plt.subplots(3, 2, figsize=(15, 10), sharex='col', layout='constrained')
 for ax, col in zip(axs.reshape(-1), occ_cols): 
     data = occ_metrics[col].copy()
     ax.plot(occ_metrics.index, data['mean'].fillna(0), '-r', label='Mean')
@@ -392,36 +429,45 @@ print('Overall:')
 print(av_occ)
 
 ######################Specialty Occupancy
-#Filter out rows where pat doesn't go to specialty
-specialty = pat.loc[~pat['Specialty'].isna()].copy()
-#Get every sample time that a patient was in the model
-specialty['sample'] = specialty.apply(lambda row: list(range(math.ceil(row['Spec Arr']/60)*60, int(row['Spec Dis']), 60)), axis=1)
-#Explode out and group up
-specialty = specialty[['Specialty', 'sample']].explode('sample').value_counts().reset_index()
-specialty['count'] = specialty['count'] / default_params.iterations
-specialty = specialty.pivot(index='sample', columns='Specialty', values='count').sort_values(by='sample')
-specialties = specialty.columns
-specialty['Day'] = specialty.index // (24*60)
+#Average and aggregate over runs and daily variation
+specialty = spec.groupby(['Day', 'specialty'], as_index=False)[['queue', 'occ']].agg(['min', q25, 'mean', q75, 'max'])
 
 #Make a plot for each one
-os.makedirs('Plots/Specialty Occupancy', exist_ok=True)
-for spec in specialties:
-    occ_metrics = specialty[['Day', spec]].groupby('Day').agg(['min', q25, 'mean', q75, 'max'])[spec]
-    fig = plt.figure(figsize=(15, 10))
-    plt.plot(occ_metrics.index, occ_metrics['mean'].fillna(0), '-r', label='Mean')
-    plt.fill_between(occ_metrics.index, occ_metrics['min'].fillna(0), occ_metrics['max'].fillna(0), color='grey', alpha=0.2, label='Min-Max')
-    plt.fill_between(occ_metrics.index, occ_metrics['q25'].fillna(0), occ_metrics['q75'].fillna(0), color='black', alpha=0.2, label='LQ-UQ')
-    plt.title(spec, fontsize=18)
-    plt.tick_params(axis='both',  which='major', labelsize=16)
-    plt.legend(fontsize=16)
-    plt.xlabel('Day', fontsize=16)
-    plt.ylabel('Occupancy', fontsize=16)
-    plt.savefig(f'Plots/Specialty Occupancy/{spec}.png', bbox_inches='tight')
+os.makedirs('Plots/Specialty', exist_ok=True)
+for spec_name in specialty['specialty'].drop_duplicates().tolist():
+    data = specialty.loc[specialty['specialty'] == spec_name].copy()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 10), layout='constrained')
+
+    #queue
+    df_queue = data['queue']
+    ax1.plot(data['Day'], df_queue['mean'].fillna(0), '-r', label='Mean')
+    ax1.fill_between(data['Day'], df_queue['min'].fillna(0), df_queue['max'].fillna(0), color='grey', alpha=0.2, label='Min-Max')
+    ax1.fill_between(data['Day'], df_queue['q25'].fillna(0), df_queue['q75'].fillna(0), color='black', alpha=0.2, label='LQ-UQ')
+    ax1.set_title('Queue', fontsize=18)
+    ax1.tick_params(axis='both',  which='major', labelsize=16)
+    ax1.legend(fontsize=16)
+    ax1.set_xlabel('Day', fontsize=16)
+    ax1.set_ylabel('Queue Length', fontsize=16)
+
+    #Occupancy
+    df_occ = data['occ']
+    ax2.plot(data['Day'], df_occ['mean'].fillna(0), '-r', label='Mean')
+    ax2.fill_between(data['Day'], df_occ['min'].fillna(0), df_occ['max'].fillna(0), color='grey', alpha=0.2, label='Min-Max')
+    ax2.fill_between(data['Day'], df_occ['q25'].fillna(0), df_occ['q75'].fillna(0), color='black', alpha=0.2, label='LQ-UQ')
+    ax2.set_title('Occupancy', fontsize=18)
+    ax2.tick_params(axis='both',  which='major', labelsize=16)
+    ax2.set_xlabel('Day', fontsize=16)
+    ax2.set_ylabel('Occupancy', fontsize=16)
+
+    fig.suptitle(spec_name, fontsize=26)
+
+    plt.savefig(f'Plots/Specialty/{spec_name.replace('&', '')}.png', bbox_inches='tight')
     plt.close()
 
-spec_occ = specialty.agg(['min', q25, 'mean', q75, 'max']).round().T
+
 print('Specialty:')
-print(spec_occ.sort_values(by='mean', ascending=False).head(5))
+print(specialty.groupby('specialty').mean()['occ'].sort_values(by='mean', ascending=False).head(5))
 
 ###################################################################################################
 ####QUEUES
@@ -504,7 +550,7 @@ print('Overall:')
 print(av_los)
 
 ###################################################################################################
-####Arrivals
+####Pathways
 ###################################################################################################
 transitions = pd.Series([(p[i], p[i+1]) for p in pat['Path'] for i in range(len(p)-1)]
                             ).value_counts().reset_index()
@@ -519,3 +565,29 @@ pathways = (default_params.transitions[['from', 'to', 'prob']]
 pathways['diff'] = abs(pathways['prob Input'] - pathways['prob Output'])
 print('------PATHWAYS------')
 print(pathways.sort_values(by='diff', ascending=False))
+
+###################################################################################################
+####Arrivals
+###################################################################################################
+daily_arrs = []
+for inp, out in [('ED_arr', 'ED Arr'), ('SDEC_arr', 'SDEC Arr'),
+                 ('MRU_SAU_arr', 'MRU or SAU Arr'), ('Ward_arr', 'Spec Arr')]:
+    data_arr = default_params.df[inp].dropna().dt.date.value_counts().mean()
+    outp_arr = (pat[out].dropna() // (60*24)).value_counts().mean() / default_params.iterations
+    daily_arrs.append([out, data_arr, outp_arr, data_arr-outp_arr])
+
+print('-----ARRIVALS------')
+print(pd.DataFrame(daily_arrs, columns=['Location', 'Input', 'Output', 'Diff']))
+
+
+
+#specialty arrivals
+inp = default_params.df[['PerformanceSpecialty', 'Ward_arr']].dropna()
+inp['Ward_arr'] = inp['Ward_arr'].dt.date
+all_dates = pd.DataFrame(itertools.product(inp['Ward_arr'].drop_duplicates(),
+                                            inp['PerformanceSpecialty'].drop_duplicates()),
+                            columns=['Ward_arr', 'PerformanceSpecialty'])
+#merge onto all dates and fill blanks with 0. Group up to get mean daily arr by specialty.
+inp_arr = (all_dates.merge(inp[['PerformanceSpecialty', 'Ward_arr']].value_counts().reset_index(),
+                        on=['Ward_arr', 'PerformanceSpecialty'], how='left').fillna(0))
+inp_arr = inp_arr.groupby('PerformanceSpecialty')['count'].mean().rename('Ward_arr')
