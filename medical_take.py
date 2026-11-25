@@ -24,7 +24,7 @@ class default_params():
     run_name = 'Limited Beds'
     run_time = 24*60*(365 + 20) #One year plus 20 day warm up time
     run_days = int(run_time/(60*24)) 
-    iterations = 10#0
+    iterations = 5#0
     sample_time = 1
     print_outs = False
     occ_sample_time = 60
@@ -60,7 +60,7 @@ class default_params():
     #########timings
     ED_LoS = 4*60
     MRU_LoS = 12*60
-    SAU_LoS = 8*60
+    SAU_LoS = 6*60
     SDEC_FSDEC_LoS = 6*60
     Spec_LoS = df.groupby('PerformanceSpecialty')['Ward_LoS'].mean()
 
@@ -72,7 +72,7 @@ class default_params():
         ED_beds = 105
         MRU_beds = 47
         SAU_beds = 19
-        SDEC_beds = 45
+        MSDEC_beds = 45
         FSDEC_beds = 10
         if opt_spec:
             spec_beds = optimise_beds(df[['PerformanceSpecialty', 'Ward_arr', 'Ward_LoS']].copy().dropna().copy(), no_beds)
@@ -83,7 +83,7 @@ class default_params():
     #Get the probabilities of each pathway in the data
     def build_path(row):
         path = ['start', row['Arrival']]
-        for col in ["MRU or SAU", "SDEC", "Spec Ward"]:
+        for col in ["MRU or SAU", "MSDEC", "Spec Ward"]:
             if pd.notna(row[col]) and row[col] != "":
                 path.append(row[col])
         path.append("Home")
@@ -139,7 +139,7 @@ class spawn_patient:
         self.MoS_queue = np.nan
         self.MoS_arr = np.nan
         self.MoS_dis = np.nan
-        self.FSDEC_or_SDEC = next((i for i in self.path if 'FSDEC' in i or 'SDEC' in i), None)
+        self.FSDEC_or_MSDEC = next((i for i in self.path if 'FSDEC' in i or 'MSDEC' in i), None)
         self.SDEC_queue = np.nan
         self.SDEC_arr = np.nan
         self.SDEC_dis = np.nan
@@ -167,7 +167,7 @@ class Medical_Take_Model:
         self.ED = simpy.PriorityResource(self.env, capacity=input_params.ED_beds)
         self.MRU = simpy.PriorityResource(self.env, capacity=input_params.MRU_beds)
         self.SAU = simpy.PriorityResource(self.env, capacity=input_params.SAU_beds)
-        self.SDEC = simpy.PriorityResource(self.env, capacity=input_params.SDEC_beds)
+        self.MSDEC = simpy.PriorityResource(self.env, capacity=input_params.MSDEC_beds)
         self.FSDEC = simpy.PriorityResource(self.env, capacity=input_params.FSDEC_beds)
         self.spec_resources = {area : simpy.PriorityResource(self.env, capacity=cap)
                                for area, cap in zip(input_params.spec_beds['Specialty'], input_params.spec_beds['No_beds'])}
@@ -182,83 +182,85 @@ class Medical_Take_Model:
             #print(f'Time out for {sampled_interarrival} until next patient')
             yield self.env.timeout(sampled_interarrival)
 
+
     def Hospital_Journey(self, pat):
         pat.model_arr = self.env.now
+
+        #To ensure the patient holds on to the previous bed while waiting for the next one, we must
+        # record the resource and request for the space currently occupied.
+        current_resource = None
+        current_request = None
+        current_departure_field = None
+
+        # For each location:
+        # resource, queue timestamp, arrival timestamp,
+        # departure timestamp, mean length of stay.
+        locations = {'ED': (self.ED, 'ED_queue', 'ED_arr', 'ED_dis',
+                            self.input_params.ED_LoS),
+                    'MRU': (self.MRU, 'MoS_queue', 'MoS_arr', 'MoS_dis',
+                            self.input_params.MRU_LoS),
+                    'SAU': (self.SAU, 'MoS_queue', 'MoS_arr', 'MoS_dis',
+                            self.input_params.SAU_LoS),
+                    'MSDEC': (self.MSDEC, 'SDEC_queue', 'SDEC_arr', 'SDEC_dis',
+                             self.input_params.SDEC_FSDEC_LoS),
+                    'FSDEC': (self.FSDEC, 'SDEC_queue', 'SDEC_arr', 'SDEC_dis',
+                              self.input_params.SDEC_FSDEC_LoS)}
+
+        #Loop over each patient pathway
         for loc in pat.path:
-            #print(f'{pat.id}, {loc}, {self.env.now}')
-
-            #ED
-            if loc == 'ED':
-                pat.ED_queue = self.env.now
-                with self.ED.request() as req:
-                    yield req
-                    pat.ED_arr = self.env.now
-                    sample_ED_time = round((random.expovariate(1.0
-                                                / self.input_params.ED_LoS)))
-
-                    yield self.env.timeout(sample_ED_time)
-                pat.ED_dis = self.env.now
-
-            #MRU
-            if loc == 'MRU':
-                pat.MoS_queue = self.env.now
-                with self.MRU.request() as req:
-                    yield req
-                    pat.MoS_arr = self.env.now
-                    sample_MRU_time = round((random.expovariate(1.0
-                                                / self.input_params.MRU_LoS)))
-                    yield self.env.timeout(sample_MRU_time)
-                pat.MoS_dis = self.env.now
-
-            #SAU
-            if loc == 'SAU':
-                pat.MoS_queue = self.env.now
-                with self.SAU.request() as req:
-                    yield req
-                    pat.MoS_arr = self.env.now
-                    sample_SAU_time = round((random.expovariate(1.0
-                                                / self.input_params.SAU_LoS)))
-                    yield self.env.timeout(sample_SAU_time)
-                pat.MoS_dis = self.env.now
-
-            #SDEC
-            if loc == 'SDEC':
-                pat.SDEC_queue = self.env.now
-                with self.SDEC.request() as req:
-                    yield req
-                    pat.SDEC_arr = self.env.now
-                    sample_SDEC_time = round((random.expovariate(1.0
-                                                / self.input_params.SDEC_FSDEC_LoS)))
-                    yield self.env.timeout(sample_SDEC_time)
-                pat.SDEC_dis = self.env.now
-
-            #FSDEC
-            if loc == 'FSDEC':
-                pat.SDEC_queue = self.env.now
-                with self.FSDEC.request() as req:
-                    yield req
-                    pat.SDEC_arr = self.env.now
-                    sample_FSDEC_time = round((random.expovariate(1.0
-                                                / self.input_params.SDEC_FSDEC_LoS)))
-                    yield self.env.timeout(sample_FSDEC_time)
-                pat.SDEC_dis = self.env.now
-
-            #Specialty Ward
+            #If direct, proceed to next location
+            if loc == 'Direct':
+                continue
+            #If home, end the loop and record the final timings
+            if loc == 'Home':
+                break
+            #If specialty ward, determine which one and LoS in the same way as above dict
             if loc == 'Specialty Ward':
-                pat.Spec_queue = self.env.now
-                bed = self.spec_resources[pat.Specialty]
-                with bed.request() as req:
-                    yield req
-                    pat.Spec_arr = self.env.now
-                    Av_LoS = self.input_params.Spec_LoS.loc[pat.Specialty]
-                    sample_Spec_time = round((random.expovariate(1.0 / Av_LoS)))
-                    yield self.env.timeout(sample_Spec_time)
-                pat.Spec_dis = self.env.now
-        
+                next_resource = self.spec_resources[pat.Specialty]
+                queue_field = 'Spec_queue'
+                arrival_field = 'Spec_arr'
+                departure_field = 'Spec_dis'
+                mean_los = self.input_params.Spec_LoS.loc[pat.Specialty]
+            #If other location, get the right values for that from above dict
+            elif loc in locations:
+                (next_resource, queue_field, arrival_field, departure_field,
+                 mean_los) = locations[loc]
+            else:
+                raise ValueError(f"Unrecognised patient location: {loc!r}")
 
+            # The patient is ready for this destination.
+            #Record the patient's start queueing time and request the next resource
+            setattr(pat, queue_field, self.env.now)
+            next_request = next_resource.request()
+            yield next_request
+
+            # The destination space is now available.
+            # Release the previous space at the time of transfer.
+            if current_resource is not None:
+                #Record the time leaving previous location
+                setattr(pat, current_departure_field, self.env.now)
+                current_resource.release(current_request)
+
+            # Record entry and retain this space.
+            setattr(pat, arrival_field, self.env.now)
+
+            #Update current resource/request
+            current_resource = next_resource
+            current_request = next_request
+            current_departure_field = departure_field
+
+            # Time in this area before becoming ready to move on.
+            sampled_los = round(random.expovariate(1.0 / mean_los))
+            yield self.env.timeout(sampled_los)
+
+        # Discharge home: release the final occupied space.
+        if current_resource is not None:
+            setattr(pat, current_departure_field, self.env.now)
+            current_resource.release(current_request)
+
+        #Store overall results
         pat.model_dis = self.env.now
         self.store_patient_results(pat)
-
 
     def store_patient_results(self, patient):
         self.patient_results.append({'Run':self.run_number,
@@ -272,7 +274,7 @@ class Medical_Take_Model:
                                      'MRU or SAU Queue':patient.MoS_queue,
                                      'MRU or SAU Arr':patient.MoS_arr,
                                      'MRU or SAU Dis':patient.MoS_dis,
-                                     '(F)SDEC':patient.FSDEC_or_SDEC,
+                                     '(F)SDEC':patient.FSDEC_or_MSDEC,
                                      'SDEC Queue':patient.SDEC_queue,
                                      'SDEC Arr':patient.SDEC_arr,
                                      'SDEC Dis':patient.SDEC_dis,
@@ -296,8 +298,8 @@ class Medical_Take_Model:
                                             'MRU Occ':self.MRU.count,
                                             'SAU Queue':len(self.SAU.queue),
                                             'SAU Occ':self.SAU.count,
-                                            'SDEC Queue':len(self.SDEC.queue),
-                                            'SDEC Occ':self.SDEC.count,
+                                            'MSDEC Queue':len(self.MSDEC.queue),
+                                            'MSDEC Occ':self.MSDEC.count,
                                             'FSDEC Queue':len(self.FSDEC.queue),
                                             'FSDEC Occ':self.FSDEC.count,
                                             'Spec Queue':spec_queue,
@@ -378,9 +380,8 @@ spec = spec.loc[spec['Day'] > 0].copy()
 ###################################################################################################
 ####4hr Performance
 ###################################################################################################
-pat['ED Leave'] = np.where(pat['ED Arr'], pat['MRU or SAU Arr'].fillna(pat['SDEC Arr']).fillna(pat['Spec Arr']).fillna(pat['Home']), np.nan)
-pat['ED Leave Day'] = pat['ED Leave'] // (24*60)
-pat['ED LoS'] = pat['ED Leave'] - pat['ED Arr']
+pat['ED Leave Day'] = pat['ED Dis'] // (24*60)
+pat['ED LoS'] = pat['ED Dis'] - pat['ED Arr']
 pat['<4hr ED'] = np.where(~pat['ED Arr'].isna(), pat['ED LoS'] <= 240, np.nan)
 
 ed4hr = (pat.groupby('ED Leave Day', as_index=False)['<4hr ED'].value_counts()
@@ -403,7 +404,7 @@ occ_metrics = (occ.groupby('Day', observed=False)
                .agg({'ED Occ':['min', q25, 'mean', q75, 'max'],
                      'MRU Occ':['min', q25, 'mean', q75, 'max'],
                      'SAU Occ':['min', q25, 'mean', q75, 'max'],
-                     'SDEC Occ':['min', q25, 'mean', q75, 'max'],
+                     'MSDEC Occ':['min', q25, 'mean', q75, 'max'],
                      'FSDEC Occ':['min', q25, 'mean', q75, 'max'],
                      'Spec Occ':['min', q25, 'mean', q75, 'max']}))
 
@@ -461,6 +462,8 @@ for spec_name in specialty['specialty'].drop_duplicates().tolist():
     ax2.set_ylabel('Occupancy', fontsize=16)
 
     fig.suptitle(spec_name, fontsize=26)
+    bed_cap = default_params.spec_beds.loc[default_params.spec_beds['Specialty'] == spec_name, 'No_beds'].iloc[0]
+    fig.text(0, 1, f'Bed Capacity: {bed_cap}', fontsize=20)
 
     plt.savefig(f'Plots/Specialty/{spec_name.replace('&', '')}.png', bbox_inches='tight')
     plt.close()
@@ -477,11 +480,11 @@ que_metrics = (occ.groupby('Day', observed=False)
                .agg({'ED Queue':['min', q25, 'mean', q75, 'max'],
                      'MRU Queue':['min', q25, 'mean', q75, 'max'],
                      'SAU Queue':['min', q25, 'mean', q75, 'max'],
-                     'SDEC Queue':['min', q25, 'mean', q75, 'max'],
+                     'MSDEC Queue':['min', q25, 'mean', q75, 'max'],
                      'FSDEC Queue':['min', q25, 'mean', q75, 'max'],
                      'Spec Queue':['min', q25, 'mean', q75, 'max']}))
 
-fig, axs = plt.subplots(3, 2, figsize=(30, 20), sharex='col', layout='constrained')
+fig, axs = plt.subplots(3, 2, figsize=(15, 10), sharex='col', layout='constrained')
 for ax, col in zip(axs.reshape(-1), que_cols): 
     data = que_metrics[col].copy()
     ax.plot(que_metrics.index, data['mean'].fillna(0), '-r', label='Mean')
@@ -503,32 +506,73 @@ print('Overall:')
 print(av_que)
 
 ###################################################################################################
+####Queue LoS
+###################################################################################################
+pat['Arrival Day'] = pat['Model Arr'] // (60*24)
+#Calculate LoS
+pat['ED Queue LoS'] = pat['ED Dis'] - pat['ED Queue']
+pat['MRU Queue LoS'] = np.where(pat['MRU or SAU'] == 'MRU', pat['MRU or SAU Dis'] - pat['MRU or SAU Queue'], np.nan)
+pat['SAU Queue LoS'] = np.where(pat['MRU or SAU'] == 'SAU', pat['MRU or SAU Dis'] - pat['MRU or SAU Queue'], np.nan)
+pat['MSDEC Queue LoS'] = np.where(pat['(F)SDEC'] == 'MSDEC', pat['SDEC Dis'] - pat['SDEC Queue'], np.nan)
+pat['FSDEC Queue LoS'] = np.where(pat['(F)SDEC'] == 'FSDEC', pat['SDEC Dis'] - pat['SDEC Queue'], np.nan)
+pat['Spec Queue LoS'] = pat['Spec Dis'] - pat['Spec Queue']
+queue_cols = ['ED Queue LoS', 'MRU Queue LoS', 'SAU Queue LoS', 'MSDEC Queue LoS', 'FSDEC Queue LoS', 'Spec Queue LoS']
+
+#Summary metrics
+los_metrics = (pat.groupby('Arrival Day', observed=False)
+               .agg({'ED Queue LoS':['min', q25, 'mean', q75, 'max'],
+                     'MRU Queue LoS':['min', q25, 'mean', q75, 'max'],
+                     'SAU Queue LoS':['min', q25, 'mean', q75, 'max'],
+                     'MSDEC Queue LoS':['min', q25, 'mean', q75, 'max'],
+                     'FSDEC Queue LoS':['min', q25, 'mean', q75, 'max'],
+                     'Spec Queue LoS':['min', q25, 'mean', q75, 'max']}))
+
+#plot
+fig, axs = plt.subplots(3, 2, figsize=(15, 10), sharex='col', layout='constrained')
+for ax, col in zip(axs.reshape(-1), queue_cols): 
+    data = los_metrics[col].copy()
+    ax.plot(los_metrics.index, data['mean'].fillna(0), '-r', label='Mean')
+    ax.fill_between(los_metrics.index, data['min'].fillna(0), data['max'].fillna(0), color='grey', alpha=0.2, label='Min-Max')
+    ax.fill_between(los_metrics.index, data['q25'].fillna(0), data['q75'].fillna(0), color='black', alpha=0.2, label='LQ-UQ')
+    ax.set_title(col.split(' ')[0].replace('Spec', 'All Specialties'), fontsize=18)
+    ax.tick_params(axis='both',  which='major', labelsize=16)
+    if col == 'ED Queue LoS':
+        ax.legend(fontsize=16)
+fig.supxlabel('Day', fontsize=16)
+fig.supylabel('LoS', fontsize=16)
+fig.suptitle('Time spent waiting for next location', fontsize=20)
+plt.savefig('Plots/Time for next loc.png', bbox_inches='tight')
+plt.close()
+
+av_los = pat[queue_cols].agg(['min', q25, 'mean', q75, 'max']).round()
+print('------Time Queueing for next loc-------')
+print('Overall:')
+print(av_los)
+
+###################################################################################################
 ####LoS
 ###################################################################################################
 pat['Arrival Day'] = pat['Model Arr'] // (60*24)
-#Calculate leave times (inc queue for next location). ED calculated earlier
-pat['MRU or SAU Leave'] = np.where(~pat['MRU or SAU Arr'].isna(), pat['SDEC Arr'].fillna(pat['Spec Arr']).fillna(pat['Home']), np.nan)
-pat['SDEC Leave'] = np.where(~pat['SDEC Arr'].isna(), pat['Spec Arr'].fillna(pat['Home']), np.nan)
-
 #Calculate LoS
-pat['MRU LoS'] = np.where(pat['MRU or SAU'] == 'MRU', pat['MRU or SAU Leave'] - pat['MRU or SAU Arr'], np.nan)
-pat['SAU LoS'] = np.where(pat['MRU or SAU'] == 'SAU', pat['MRU or SAU Leave'] - pat['MRU or SAU Arr'], np.nan)
-pat['SDEC LoS'] = np.where(pat['(F)SDEC'] == 'SDEC', pat['SDEC Leave'] - pat['SDEC Arr'], np.nan)
-pat['FSDEC LoS'] = np.where(pat['(F)SDEC'] == 'FSDEC', pat['SDEC Leave'] - pat['SDEC Arr'], np.nan)
-pat['Spec LoS'] = pat['Home'] - pat['Spec Arr']
+pat['MRU LoS'] = np.where(pat['MRU or SAU'] == 'MRU', pat['MRU or SAU Dis'] - pat['MRU or SAU Arr'], np.nan)
+pat['SAU LoS'] = np.where(pat['MRU or SAU'] == 'SAU', pat['MRU or SAU Dis'] - pat['MRU or SAU Arr'], np.nan)
+pat['MSDEC LoS'] = np.where(pat['(F)SDEC'] == 'MSDEC', pat['SDEC Dis'] - pat['SDEC Arr'], np.nan)
+pat['FSDEC LoS'] = np.where(pat['(F)SDEC'] == 'FSDEC', pat['SDEC Dis'] - pat['SDEC Arr'], np.nan)
+pat['Spec LoS'] = pat['Spec Dis'] - pat['Spec Arr']
+
 
 #Summary metrics
-los_cols = [col for col in pat.columns if 'LoS' in col]
+los_cols = ['ED LoS', 'MRU LoS', 'SAU LoS', 'MSDEC LoS', 'FSDEC LoS', 'Spec LoS']
 los_metrics = (pat.groupby('Arrival Day', observed=False)
                .agg({'ED LoS':['min', q25, 'mean', q75, 'max'],
                      'MRU LoS':['min', q25, 'mean', q75, 'max'],
                      'SAU LoS':['min', q25, 'mean', q75, 'max'],
-                     'SDEC LoS':['min', q25, 'mean', q75, 'max'],
+                     'MSDEC LoS':['min', q25, 'mean', q75, 'max'],
                      'FSDEC LoS':['min', q25, 'mean', q75, 'max'],
                      'Spec LoS':['min', q25, 'mean', q75, 'max']}))
 
 #plot
-fig, axs = plt.subplots(3, 2, figsize=(30, 20), sharex='col', layout='constrained')
+fig, axs = plt.subplots(3, 2, figsize=(15, 10), sharex='col', layout='constrained')
 for ax, col in zip(axs.reshape(-1), los_cols): 
     data = los_metrics[col].copy()
     ax.plot(los_metrics.index, data['mean'].fillna(0), '-r', label='Mean')
